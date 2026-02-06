@@ -37,8 +37,7 @@ function Test-IsVMwareVM {
     [CmdletBinding()]
     param()
 
-    $model = (Get-CimInstance Win32_ComputerSystem).Model
-    return $model -match 'VMware'
+    return [bool]((Get-WmiObject -Class Win32_SystemEnclosure).ChassisTypes -eq 1)
 }
 #endregion
 
