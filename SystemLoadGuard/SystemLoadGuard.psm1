@@ -22,7 +22,7 @@ catch {
 #endregion
 
 
-#region Test-IsVMwareVM
+#region Test-IsVirtualMachine
 <#
 .SYNOPSIS
 Determines whether the current system is a VMware virtual machine.
@@ -33,7 +33,7 @@ If the model name contains 'VMware', the system is treated as a virtual desktop.
 Virtual machines require additional load checks because CPU scheduling
 delays from the hypervisor are not visible through CPU percentage alone.
 #>
-function Test-IsVMwareVM {
+function Test-IsVirtualMachine {
     [CmdletBinding()]
     param()
 
@@ -105,11 +105,11 @@ function Wait-ForSystemReadyToRun {
         [int]$SampleInterval = 5
     )
 
-    $isVMwareVM = Test-IsVMwareVM
+    $IsVirtualMachine = Test-IsVirtualMachine
     $stableTime = 0
     $elapsedPreCheck = 0
 
-    Write-Verbose "System Type: $($isVMwareVM ? 'VMware VM' : 'Physical Desktop')"
+    Write-Verbose "System Type: $($IsVirtualMachine ? 'VMware VM' : 'Physical Desktop')"
     Write-Verbose "Starting pre-run monitoring..."
 
     # Phase 1 — Monitor system load before the scheduled task time
@@ -117,7 +117,7 @@ function Wait-ForSystemReadyToRun {
     while ($elapsedPreCheck -lt $PreCheckWindow) {
         $load = Get-SystemLoadSnapshot
 
-        if ($isVMwareVM) {
+        if ($IsVirtualMachine) {
             if ($load.CPUPercent -ge $CpuThreshold -or $load.QueueLength -ge $load.LogicalCores) { break }
         }
         else {
@@ -134,7 +134,7 @@ function Wait-ForSystemReadyToRun {
     while ($true) {
         $load = Get-SystemLoadSnapshot
 
-        if ($isVMwareVM) {
+        if ($IsVirtualMachine) {
             # On VMware VMs, both CPU usage and queue length must be healthy
             $healthy = ($load.CPUPercent -lt $CpuThreshold) -and ($load.QueueLength -lt $load.LogicalCores)
         }
@@ -164,4 +164,4 @@ function Wait-ForSystemReadyToRun {
 
 
 # Export only the public functions
-Export-ModuleMember -Function Test-IsVMwareVM, Get-SystemLoadSnapshot, Wait-ForSystemReadyToRun
+Export-ModuleMember -Function Test-IsVirtualMachine, Get-SystemLoadSnapshot, Wait-ForSystemReadyToRun
