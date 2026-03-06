@@ -132,7 +132,8 @@ Allows overwriting a populated slot when AttributeNumber is specified.
 function Add-M365ExtensionAttribute {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+        [Alias('Id')]
         [string]$UserId,
 
         [Parameter(Mandatory)]
@@ -145,56 +146,58 @@ function Add-M365ExtensionAttribute {
         [switch]$AllowOverwrite
     )
 
-    if ($Value.Trim() -eq '') { throw "Value cannot be empty." }
+    process {
+        if ($Value.Trim() -eq '') { throw "Value cannot be empty." }
 
-    $user = Get-MgUserWithExtensionAttributes -UserId $UserId
-    $attrs = Resolve-ExtensionAttributes -User $user
+        $user = Get-MgUserWithExtensionAttributes -UserId $UserId
+        $attrs = Resolve-ExtensionAttributes -User $user
 
-    if ($PSBoundParameters.ContainsKey('AttributeNumber')) {
-        $index = $AttributeNumber - 1
-        $current = $attrs[$index]
-        if ($null -ne $current -and $current.ToString().Trim() -ne '') {
-            if ($current.ToString().Equals($Value, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return [PSCustomObject]@{
-                    UserId         = $user.Id
-                    UserPrincipalName = $user.UserPrincipalName
-                    AddedAttribute = "ExtensionAttribute$AttributeNumber"
-                    Value          = $Value
-                    Attributes     = $attrs
+        if ($PSBoundParameters.ContainsKey('AttributeNumber')) {
+            $index = $AttributeNumber - 1
+            $current = $attrs[$index]
+            if ($null -ne $current -and $current.ToString().Trim() -ne '') {
+                if ($current.ToString().Equals($Value, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return [PSCustomObject]@{
+                        UserId         = $user.Id
+                        UserPrincipalName = $user.UserPrincipalName
+                        AddedAttribute = "ExtensionAttribute$AttributeNumber"
+                        Value          = $Value
+                        Attributes     = $attrs
+                    }
+                }
+                if (-not $AllowOverwrite) {
+                    throw "extensionAttribute$AttributeNumber already has a value. Use -AllowOverwrite to replace it."
                 }
             }
-            if (-not $AllowOverwrite) {
-                throw "extensionAttribute$AttributeNumber already has a value. Use -AllowOverwrite to replace it."
+            if (Test-HasDuplicateAttributeValue -Attributes $attrs -Value $Value -ExcludeIndex $index) {
+                throw "Value already exists in extension attributes for user '$UserId'."
             }
+            $attrs[$index] = $Value
+            $targetSlot = $AttributeNumber
         }
-        if (Test-HasDuplicateAttributeValue -Attributes $attrs -Value $Value -ExcludeIndex $index) {
-            throw "Value already exists in extension attributes for user '$UserId'."
+        else {
+            if (Test-HasDuplicateAttributeValue -Attributes $attrs -Value $Value) {
+                throw "Value already exists in extension attributes for user '$UserId'."
+            }
+            $index = Find-FirstEmptyAttributeIndex -Attributes $attrs
+            if ($index -lt 0) { throw "No empty extensionAttribute slots available for user '$UserId'." }
+            $attrs[$index] = $Value
+            $targetSlot = $index + 1
         }
-        $attrs[$index] = $Value
-        $targetSlot = $AttributeNumber
-    }
-    else {
-        if (Test-HasDuplicateAttributeValue -Attributes $attrs -Value $Value) {
-            throw "Value already exists in extension attributes for user '$UserId'."
+
+        $payload = ConvertTo-ExtensionAttributesHashtable -Attributes $attrs
+
+        if ($PSCmdlet.ShouldProcess($UserId, "Add extensionAttribute$targetSlot")) {
+            Update-MgUser -UserId $UserId -OnPremisesExtensionAttributes $payload | Out-Null
         }
-        $index = Find-FirstEmptyAttributeIndex -Attributes $attrs
-        if ($index -lt 0) { throw "No empty extensionAttribute slots available for user '$UserId'." }
-        $attrs[$index] = $Value
-        $targetSlot = $index + 1
-    }
 
-    $payload = ConvertTo-ExtensionAttributesHashtable -Attributes $attrs
-
-    if ($PSCmdlet.ShouldProcess($UserId, "Add extensionAttribute$targetSlot")) {
-        Update-MgUser -UserId $UserId -OnPremisesExtensionAttributes $payload | Out-Null
-    }
-
-    [PSCustomObject]@{
-        UserId         = $user.Id
-        UserPrincipalName = $user.UserPrincipalName
-        AddedAttribute = "ExtensionAttribute$targetSlot"
-        Value          = $Value
-        Attributes     = $attrs
+        [PSCustomObject]@{
+            UserId         = $user.Id
+            UserPrincipalName = $user.UserPrincipalName
+            AddedAttribute = "ExtensionAttribute$targetSlot"
+            Value          = $Value
+            Attributes     = $attrs
+        }
     }
 }
 
@@ -295,48 +298,56 @@ Slot number (1-15) to remove.
 Value to remove.
 #>
 function Remove-M365ExtensionAttribute {
-    [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'ByNumber')]
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, ValueFromPipelineByPropertyName)]
+        [Alias('Id')]
         [string]$UserId,
 
-        [Parameter(Mandatory, ParameterSetName = 'ByNumber')]
+        [Parameter(ValueFromPipelineByPropertyName)]
         [ValidateRange(1, 15)]
         [int]$AttributeNumber,
 
-        [Parameter(Mandatory, ParameterSetName = 'ByValue')]
+        [Parameter(ValueFromPipelineByPropertyName)]
         [string]$Value
     )
 
-    $user = Get-MgUserWithExtensionAttributes -UserId $UserId
-    $attrs = Resolve-ExtensionAttributes -User $user
-
-    if ($PSCmdlet.ParameterSetName -eq 'ByValue') {
-        $index = Find-AttributeIndexByValue -Attributes $attrs -Value $Value
-        if ($index -lt 0) { throw "Value not found in extension attributes for user '$UserId'." }
-        $attributeLabel = "ExtensionAttribute" + ($index + 1)
-    }
-    else {
-        $index = $AttributeNumber - 1
-        $attributeLabel = "ExtensionAttribute$AttributeNumber"
-        if ($null -eq $attrs[$index] -or $attrs[$index].ToString().Trim() -eq '') {
-            throw "extensionAttribute$AttributeNumber is already empty for user '$UserId'."
+    process {
+        if (-not $PSBoundParameters.ContainsKey('AttributeNumber') -and -not $PSBoundParameters.ContainsKey('Value')) {
+            throw "Either -AttributeNumber or -Value must be specified."
         }
-    }
 
-    $newAttrs = Shift-ExtensionAttributesLeft -Attributes $attrs -RemoveIndex $index
-    $payload = ConvertTo-ExtensionAttributesHashtable -Attributes $newAttrs
+        $user = Get-MgUserWithExtensionAttributes -UserId $UserId
+        $attrs = Resolve-ExtensionAttributes -User $user
 
-    if ($PSCmdlet.ShouldProcess($UserId, "Remove $attributeLabel and shift left")) {
-        Update-MgUser -UserId $UserId -OnPremisesExtensionAttributes $payload | Out-Null
-    }
+        if ($PSBoundParameters.ContainsKey('Value')) {
+            $index = Find-AttributeIndexByValue -Attributes $attrs -Value $Value
+            if ($index -lt 0) { throw "Value '$Value' not found in extension attributes for user '$UserId'." }
+            $attributeLabel = "ExtensionAttribute" + ($index + 1)
+        }
+        else {
+            $index = $AttributeNumber - 1
+            $attributeLabel = "ExtensionAttribute$AttributeNumber"
+            if ($null -eq $attrs[$index] -or $attrs[$index].ToString().Trim() -eq '') {
+                throw "extensionAttribute$AttributeNumber is already empty for user '$UserId'."
+            }
+        }
 
-    [PSCustomObject]@{
-        UserId         = $user.Id
-        UserPrincipalName = $user.UserPrincipalName
-        RemovedAttribute = $attributeLabel
-        RemovedValue   = if ($PSCmdlet.ParameterSetName -eq 'ByValue') { $Value } else { $attrs[$index] }
-        Attributes     = $newAttrs
+        $removedValue = $attrs[$index]
+        $newAttrs = Shift-ExtensionAttributesLeft -Attributes $attrs -RemoveIndex $index
+        $payload = ConvertTo-ExtensionAttributesHashtable -Attributes $newAttrs
+
+        if ($PSCmdlet.ShouldProcess($UserId, "Remove $attributeLabel ('$removedValue') and shift left")) {
+            Update-MgUser -UserId $UserId -OnPremisesExtensionAttributes $payload | Out-Null
+        }
+
+        [PSCustomObject]@{
+            UserId            = $user.Id
+            UserPrincipalName = $user.UserPrincipalName
+            RemovedAttribute  = $attributeLabel
+            RemovedValue      = $removedValue
+            Attributes        = $newAttrs
+        }
     }
 }
 
@@ -383,10 +394,21 @@ function Find-M365UsersWithExtensionAttribute {
     }
 
     $props = 'id,displayName,userPrincipalName,onPremisesExtensionAttributes'
-    $params = @{ Filter = $filter; Property = $props; ConsistencyLevel = 'eventual' }
+    $params = @{ Filter = $filter; Property = $props; ConsistencyLevel = 'eventual'; CountVariable = 'userCount' }
     if ($All) { $params['All'] = $true }
 
-    return Get-MgUser @params
+    foreach ($user in (Get-MgUser @params)) {
+        $attrs = Resolve-ExtensionAttributes -User $user
+        $index = Find-AttributeIndexByValue -Attributes $attrs -Value $Value
+        [PSCustomObject]@{
+            Id                           = $user.Id
+            UserPrincipalName            = $user.UserPrincipalName
+            DisplayName                  = $user.DisplayName
+            Value                        = $Value
+            AttributeNumber              = if ($index -ge 0) { $index + 1 } else { $null }
+            OnPremisesExtensionAttributes = $user.OnPremisesExtensionAttributes
+        }
+    }
 }
 
 <#[
