@@ -100,7 +100,7 @@ function Get-MgUserWithExtensionAttributes {
 function ConvertTo-ODataStringLiteral {
     param([string]$Value)
 
-    return $Value -replace \"'\", \"''\"
+    return $Value -replace "'", "''"
 }
 
 #endregion
