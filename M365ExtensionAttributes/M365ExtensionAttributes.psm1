@@ -1,5 +1,26 @@
 #region ======== Private Helpers ========
 
+function Assert-MgGraphConnection {
+    param(
+        [string[]]$RequiredScopes = @('User.ReadWrite.All')
+    )
+
+    if (-not (Get-Module -ListAvailable -Name 'Microsoft.Graph.Users')) {
+        throw "Microsoft.Graph.Users module is not installed. Run: Install-Module Microsoft.Graph -Scope CurrentUser"
+    }
+
+    $ctx = Get-MgContext
+    if (-not $ctx) {
+        Connect-MgGraph -Scopes $RequiredScopes -NoWelcome
+        return
+    }
+
+    $missing = $RequiredScopes | Where-Object { $_ -notin $ctx.Scopes }
+    if ($missing) {
+        Connect-MgGraph -Scopes $RequiredScopes -NoWelcome
+    }
+}
+
 function Resolve-ExtensionAttributes {
     param([object]$User)
 
@@ -147,6 +168,7 @@ function Add-M365ExtensionAttribute {
     )
 
     process {
+        Assert-MgGraphConnection
         if ($Value.Trim() -eq '') { throw "Value cannot be empty." }
 
         $user = Get-MgUserWithExtensionAttributes -UserId $UserId
@@ -238,6 +260,7 @@ function Set-M365ExtensionAttribute {
         [switch]$AllowOverwrite
     )
 
+    Assert-MgGraphConnection
     if ($Value.Trim() -eq '') { throw "Value cannot be empty." }
 
     $user = Get-MgUserWithExtensionAttributes -UserId $UserId
@@ -313,6 +336,7 @@ function Remove-M365ExtensionAttribute {
     )
 
     process {
+        Assert-MgGraphConnection
         if (-not $PSBoundParameters.ContainsKey('AttributeNumber') -and -not $PSBoundParameters.ContainsKey('Value')) {
             throw "Either -AttributeNumber or -Value must be specified."
         }
@@ -378,6 +402,7 @@ function Find-M365UsersWithExtensionAttribute {
         [switch]$All
     )
 
+    Assert-MgGraphConnection
     if ($Value.Trim() -eq '') { throw "Value cannot be empty." }
 
     $safeValue = ConvertTo-ODataStringLiteral -Value $Value
