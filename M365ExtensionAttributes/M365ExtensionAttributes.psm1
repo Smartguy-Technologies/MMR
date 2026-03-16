@@ -67,13 +67,18 @@ function Test-HasDuplicateAttributeValue {
 }
 
 function Find-AttributeIndexByValue {
-    param([object[]]$Attributes, [string]$Value)
+    param([object[]]$Attributes, [string]$Value, [switch]$Wildcard)
 
     for ($i = 0; $i -lt $Attributes.Count; $i++) {
         $item = $Attributes[$i]
         if ($null -ne $item -and $item.ToString().Trim() -ne '') {
-            if ($item.ToString().Equals($Value, [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $i
+            if ($Wildcard) {
+                if ($item.ToString() -like $Value) { return $i }
+            }
+            else {
+                if ($item.ToString().Equals($Value, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    return $i
+                }
             }
         }
     }
@@ -122,6 +127,75 @@ function ConvertTo-ODataStringLiteral {
     param([string]$Value)
 
     return $Value -replace "'", "''"
+}
+
+function Get-NaturalSortKey {
+    param([string]$Value)
+
+    # Split on digit runs; pad each numeric segment so string comparison == numeric comparison
+    $parts = [regex]::Split($Value, '(\d+)')
+    ($parts | ForEach-Object {
+        if ($_ -match '^\d+$') { $_.PadLeft(20, '0') } else { $_.ToLowerInvariant() }
+    }) -join ''
+}
+
+function Invoke-ExtensionAttributeOptimize {
+    param(
+        [object]$User,
+        [System.Management.Automation.PSCmdlet]$Cmdlet
+    )
+
+    $attrs = Resolve-ExtensionAttributes -User $User
+
+    # Collect unique non-empty values (first occurrence wins for duplicates)
+    $seen   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $unique = [System.Collections.Generic.List[string]]::new()
+    $duplicatesRemoved = 0
+
+    foreach ($attr in $attrs) {
+        if ($null -ne $attr -and $attr.ToString().Trim() -ne '') {
+            if ($seen.Add($attr.ToString())) {
+                $unique.Add($attr.ToString())
+            } else {
+                $duplicatesRemoved++
+            }
+        }
+    }
+
+    # Natural sort (alpha + numeric ordering within strings)
+    $sorted = @($unique | Sort-Object { Get-NaturalSortKey $_ })
+
+    # Pack into a fresh 15-slot array with no gaps
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($v in $sorted) { $list.Add($v) }
+    while ($list.Count -lt 15) { $list.Add($null) }
+    $newAttrs = $list.ToArray()
+
+    # Determine whether anything actually changed
+    $changed = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        $orig = if ($null -eq $attrs[$i])    { '' } else { $attrs[$i].ToString() }
+        $new  = if ($null -eq $newAttrs[$i]) { '' } else { $newAttrs[$i].ToString() }
+        if ($orig -ne $new) { $changed = $true; break }
+    }
+
+    if ($changed) {
+        $action = "Remove $duplicatesRemoved duplicate(s), sort and compact extension attributes"
+        if ($Cmdlet.ShouldProcess($User.UserPrincipalName, $action)) {
+            $payload = ConvertTo-ExtensionAttributesHashtable -Attributes $newAttrs
+            Update-MgUser -UserId $User.Id -OnPremisesExtensionAttributes $payload | Out-Null
+        }
+    }
+
+    [PSCustomObject]@{
+        Id                = $User.Id
+        UserPrincipalName = $User.UserPrincipalName
+        DisplayName       = $User.DisplayName
+        Changed           = $changed
+        DuplicatesRemoved = $duplicatesRemoved
+        Before            = $attrs
+        After             = $newAttrs
+    }
 }
 
 #endregion
@@ -381,13 +455,19 @@ Finds users with a matching extension attribute value.
 
 .DESCRIPTION
 Searches for users with a matching value across all extensionAttribute slots,
-or within a specific slot if AttributeNumber is provided.
+or within a specific slot if AttributeNumber is provided. Supports PowerShell
+wildcard characters (* and ?) in the Value parameter. When wildcards are
+detected, filtering is performed client-side after fetching all users, which
+may be slower on large tenants.
 
 .PARAMETER Value
-Value to search for.
+Value to search for. Supports PowerShell wildcards (* and ?).
 
 .PARAMETER AttributeNumber
 Optional specific slot (1-15).
+
+.PARAMETER All
+Return all pages of results.
 #>
 function Find-M365UsersWithExtensionAttribute {
     [CmdletBinding()]
@@ -405,34 +485,112 @@ function Find-M365UsersWithExtensionAttribute {
     Assert-MgGraphConnection
     if ($Value.Trim() -eq '') { throw "Value cannot be empty." }
 
-    $safeValue = ConvertTo-ODataStringLiteral -Value $Value
+    $isWildcard = [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Value)
+    $props = 'id,displayName,userPrincipalName,onPremisesExtensionAttributes'
 
-    if ($PSBoundParameters.ContainsKey('AttributeNumber')) {
-        $filter = "onPremisesExtensionAttributes/extensionAttribute$AttributeNumber eq '$safeValue'"
-    }
-    else {
-        $parts = @()
-        for ($i = 1; $i -le 15; $i++) {
-            $parts += "onPremisesExtensionAttributes/extensionAttribute$i eq '$safeValue'"
+    if ($isWildcard) {
+        # Client-side wildcard filtering — fetch users that have any extension attribute set
+        $slotNumbers = if ($PSBoundParameters.ContainsKey('AttributeNumber')) {
+            @($AttributeNumber)
+        } else {
+            1..15
+        }
+
+        $parts = $slotNumbers | ForEach-Object {
+            "onPremisesExtensionAttributes/extensionAttribute$_ ne null"
         }
         $filter = $parts -join ' or '
-    }
 
-    $props = 'id,displayName,userPrincipalName,onPremisesExtensionAttributes'
-    $params = @{ Filter = $filter; Property = $props; ConsistencyLevel = 'eventual'; CountVariable = 'userCount' }
-    if ($All) { $params['All'] = $true }
+        $params = @{ Filter = $filter; Property = $props; ConsistencyLevel = 'eventual'; CountVariable = 'userCount' }
+        if ($All) { $params['All'] = $true }
 
-    foreach ($user in (Get-MgUser @params)) {
-        $attrs = Resolve-ExtensionAttributes -User $user
-        $index = Find-AttributeIndexByValue -Attributes $attrs -Value $Value
-        [PSCustomObject]@{
-            Id                           = $user.Id
-            UserPrincipalName            = $user.UserPrincipalName
-            DisplayName                  = $user.DisplayName
-            Value                        = $Value
-            AttributeNumber              = if ($index -ge 0) { $index + 1 } else { $null }
-            OnPremisesExtensionAttributes = $user.OnPremisesExtensionAttributes
+        foreach ($user in (Get-MgUser @params)) {
+            $attrs = Resolve-ExtensionAttributes -User $user
+            $matched = @()
+            foreach ($slot in $slotNumbers) {
+                $item = $attrs[$slot - 1]
+                if ($null -ne $item -and $item.ToString().Trim() -ne '' -and $item.ToString() -like $Value) {
+                    $matched += $slot
+                }
+            }
+            foreach ($slot in $matched) {
+                [PSCustomObject]@{
+                    Id                            = $user.Id
+                    UserPrincipalName             = $user.UserPrincipalName
+                    DisplayName                   = $user.DisplayName
+                    Value                         = $attrs[$slot - 1]
+                    AttributeNumber               = $slot
+                    OnPremisesExtensionAttributes = $user.OnPremisesExtensionAttributes
+                }
+            }
         }
+    }
+    else {
+        $safeValue = ConvertTo-ODataStringLiteral -Value $Value
+
+        if ($PSBoundParameters.ContainsKey('AttributeNumber')) {
+            $filter = "onPremisesExtensionAttributes/extensionAttribute$AttributeNumber eq '$safeValue'"
+        }
+        else {
+            $parts = @()
+            for ($i = 1; $i -le 15; $i++) {
+                $parts += "onPremisesExtensionAttributes/extensionAttribute$i eq '$safeValue'"
+            }
+            $filter = $parts -join ' or '
+        }
+
+        $params = @{ Filter = $filter; Property = $props; ConsistencyLevel = 'eventual'; CountVariable = 'userCount' }
+        if ($All) { $params['All'] = $true }
+
+        foreach ($user in (Get-MgUser @params)) {
+            $attrs = Resolve-ExtensionAttributes -User $user
+            $index = Find-AttributeIndexByValue -Attributes $attrs -Value $Value
+            [PSCustomObject]@{
+                Id                            = $user.Id
+                UserPrincipalName             = $user.UserPrincipalName
+                DisplayName                   = $user.DisplayName
+                Value                         = $Value
+                AttributeNumber               = if ($index -ge 0) { $index + 1 } else { $null }
+                OnPremisesExtensionAttributes = $user.OnPremisesExtensionAttributes
+            }
+        }
+    }
+}
+
+<#[
+.SYNOPSIS
+Gets all extension attributes for a single user.
+
+.DESCRIPTION
+Retrieves extensionAttribute1-15 for the specified user and returns them as a
+structured object. Empty slots are returned as null.
+
+.PARAMETER UserId
+User ID or UPN.
+#>
+function Get-M365ExtensionAttributes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('Id', 'UserPrincipalName')]
+        [string]$UserId
+    )
+
+    process {
+        Assert-MgGraphConnection
+        $user = Get-MgUserWithExtensionAttributes -UserId $UserId
+        $attrs = Resolve-ExtensionAttributes -User $user
+
+        $result = [ordered]@{
+            Id                = $user.Id
+            UserPrincipalName = $user.UserPrincipalName
+            DisplayName       = $user.DisplayName
+        }
+        for ($i = 1; $i -le 15; $i++) {
+            $result["ExtensionAttribute$i"] = $attrs[$i - 1]
+        }
+
+        [PSCustomObject]$result
     }
 }
 
@@ -518,6 +676,68 @@ function Remove-M365ExtensionAttributeBulk {
         }
     }
     return $results
+}
+
+<#[
+.SYNOPSIS
+Deduplicates, sorts, and compacts extension attributes for one user or all users.
+
+.DESCRIPTION
+For each processed user, this function:
+  1. Removes duplicate values (case-insensitive; the first occurrence is kept).
+  2. Sorts the remaining values in natural order (alphabetical with proper
+     numeric ordering, so "Group2" sorts before "Group10").
+  3. Compacts the values into consecutive slots starting at extensionAttribute1
+     with no gaps (e.g. will never leave extensionAttribute4 empty while
+     extensionAttribute5 is populated).
+
+Returns a result object per user showing whether a change was made, how many
+duplicates were removed, and the Before/After attribute arrays. Use -WhatIf to
+preview changes without writing anything.
+
+.PARAMETER UserId
+User ID or UPN of a single user to optimise. Accepts pipeline input.
+
+.PARAMETER All
+Process every user in the tenant that has at least one extension attribute set.
+
+.EXAMPLE
+Optimize-M365ExtensionAttributes -UserId 'jdoe@contoso.com' -WhatIf
+
+.EXAMPLE
+# Process all users; show only those that were actually changed
+Optimize-M365ExtensionAttributes -All | Where-Object Changed
+#>
+function Optimize-M365ExtensionAttributes {
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'ByUser')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'ByUser',
+                   ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('Id', 'UserPrincipalName')]
+        [string]$UserId,
+
+        [Parameter(Mandatory, ParameterSetName = 'AllUsers')]
+        [switch]$All
+    )
+
+    begin { Assert-MgGraphConnection }
+
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'AllUsers') {
+            $filter = (1..15 | ForEach-Object {
+                "onPremisesExtensionAttributes/extensionAttribute$_ ne null"
+            }) -join ' or '
+
+            $props = 'id,displayName,userPrincipalName,onPremisesExtensionAttributes'
+            Get-MgUser -Filter $filter -Property $props `
+                       -ConsistencyLevel 'eventual' -CountVariable 'userCount' -All |
+                ForEach-Object { Invoke-ExtensionAttributeOptimize -User $_ -Cmdlet $PSCmdlet }
+        }
+        else {
+            $user = Get-MgUserWithExtensionAttributes -UserId $UserId
+            Invoke-ExtensionAttributeOptimize -User $user -Cmdlet $PSCmdlet
+        }
+    }
 }
 
 #endregion
